@@ -5,6 +5,7 @@
 #
 # Asks for the format file and MySQL login on startup.
 # Commands while running: start <name> | end | status | quit
+# Shared memory capture needs Windows; UDP capture also runs on Linux.
 import codecs
 import csv
 import ctypes
@@ -64,7 +65,8 @@ class PacketFormat:
 
         self.name = spec.get("name", os.path.basename(path))
         self.database = spec["database"]
-        self.csv_dir = os.path.normpath(os.path.join(SCRIPT_DIR, spec["csv_dir"]))  # relative to this script
+        # Relative to this script. Format files may use Windows separators, which Linux would keep in the folder name
+        self.csv_dir = os.path.normpath(os.path.join(SCRIPT_DIR, spec["csv_dir"].replace("\\", "/")))
         self.working_table = spec["working_table"]
         self.active_field = spec.get("active_field")
         self.active_value = spec.get("active_value")
@@ -118,6 +120,8 @@ class PacketFormat:
         method = capture.get("method") if isinstance(capture, dict) else None
         if method not in CAPTURE_METHODS:
             raise FormatError(f"capture.method must be one of {', '.join(CAPTURE_METHODS)}")
+        if method in WINDOWS_ONLY_METHODS and sys.platform != "win32":
+            raise FormatError(f"capture.method '{method}' only works on Windows. On this system use a udp format.")
         self.capture = CAPTURE_METHODS[method](self, capture)
 
     def finish_row(self, raw):
@@ -224,16 +228,17 @@ class MemoryBasicInformation(ctypes.Structure):
                 ("Protect", wintypes.DWORD), ("Type", wintypes.DWORD)]
 
 
-kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-kernel32.OpenFileMappingW.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR)
-kernel32.OpenFileMappingW.restype = wintypes.HANDLE
-kernel32.MapViewOfFile.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, ctypes.c_size_t)
-kernel32.MapViewOfFile.restype = ctypes.c_void_p
-kernel32.UnmapViewOfFile.argtypes = (ctypes.c_void_p,)
-kernel32.VirtualQuery.argtypes = (ctypes.c_void_p, ctypes.POINTER(MemoryBasicInformation), ctypes.c_size_t)
-kernel32.VirtualQuery.restype = ctypes.c_size_t
-kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
-FILE_MAP_READ = 0x0004
+if sys.platform == "win32":
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenFileMappingW.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR)
+    kernel32.OpenFileMappingW.restype = wintypes.HANDLE
+    kernel32.MapViewOfFile.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, ctypes.c_size_t)
+    kernel32.MapViewOfFile.restype = ctypes.c_void_p
+    kernel32.UnmapViewOfFile.argtypes = (ctypes.c_void_p,)
+    kernel32.VirtualQuery.argtypes = (ctypes.c_void_p, ctypes.POINTER(MemoryBasicInformation), ctypes.c_size_t)
+    kernel32.VirtualQuery.restype = ctypes.c_size_t
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    FILE_MAP_READ = 0x0004
 
 
 class MappedView:
@@ -591,6 +596,7 @@ CAPTURE_METHODS = {
     "shared_memory": SharedMemoryCapture,
     "self_described_memory": SelfDescribedMemoryCapture,
 }
+WINDOWS_ONLY_METHODS = ("shared_memory", "self_described_memory")
 
 
 def prompt_format():
@@ -607,8 +613,8 @@ def prompt_format():
             print(f"Bad format file {path}: {e}")
 
 
-def check_zerotier(server_ip):
-    """Exit unless the ZeroTier service is running and an adapter is up on the server's subnet."""
+def windows_zerotier_adapters():
+    """The ZeroTier adapters that are up. Exit if the service isn't running."""
     # zerotier-cli needs admin rights, so this reads the service and adapter state instead
     script = (
         "$service = (Get-Service ZeroTierOneService -ErrorAction SilentlyContinue).Status;"
@@ -627,8 +633,25 @@ def check_zerotier(server_ip):
 
     if state["service"] != "Running":
         sys.exit(f"ZeroTier is not connected: the service is {state['service'] or 'not installed'}.")
-    adapters = state["adapters"] or []
-    up = [adapter for adapter in adapters if adapter["status"] == "Up"]
+    return [adapter for adapter in state["adapters"] or [] if adapter["status"] == "Up"]
+
+
+def linux_zerotier_adapters():
+    """The ZeroTier adapters that are up, which only exist while the service is running."""
+    # zerotier-cli needs root here too, so this reads the adapters instead. ZeroTier names them zt<id>
+    try:
+        result = subprocess.run(["ip", "-json", "-4", "addr", "show", "up"],
+                                capture_output=True, text=True, timeout=30)
+        links = json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as e:
+        sys.exit(f"Could not read ZeroTier state: {e}")
+    return [{"name": link["ifname"], "ips": [f"{a['local']}/{a['prefixlen']}" for a in link.get("addr_info", [])]}
+            for link in links if link.get("ifname", "").startswith("zt")]  # links with no IPv4 address come back empty
+
+
+def check_zerotier(server_ip):
+    """Exit unless the ZeroTier service is running and an adapter is up on the server's subnet."""
+    up = windows_zerotier_adapters() if sys.platform == "win32" else linux_zerotier_adapters()
     if not up:
         sys.exit("ZeroTier is not connected: no ZeroTier network adapter is up. Join the network and try again.")
 
