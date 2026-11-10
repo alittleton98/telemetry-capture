@@ -28,6 +28,7 @@ import mysql.connector
 
 DB_HOST = "10.76.5.220"
 DB_PORT = 3306
+LOCAL_HOST = "127.0.0.1"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 FLUSH_INTERVAL = 0.5  # seconds between batched inserts; a per-packet commit over ZeroTier would drop packets
@@ -664,10 +665,13 @@ def check_zerotier(server_ip):
     sys.exit(f"ZeroTier is running, but no adapter has an address on the same network as {server_ip}.")
 
 
-def connect_database(database):
+def connect_database(database, runLocal = False):
     """Ask for a login until the server accepts one. Exit with the reason on any other failure."""
     try:
-        socket.create_connection((DB_HOST, DB_PORT), timeout=5).close()
+        if (runLocal):
+            socket.create_connection((LOCAL_HOST, DB_PORT), timeout=5).close()
+        else:
+            socket.create_connection((DB_HOST, DB_PORT), timeout=5).close()
     except OSError as e:
         sys.exit(f"Can't reach MySQL at {DB_HOST}:{DB_PORT} ({e}). Check that the server is on, listening on "
                  f"its ZeroTier address (bind-address), and that its firewall allows port {DB_PORT}.")
@@ -907,7 +911,6 @@ class Recorder:
             session.outfile.close()
         self.capture.close()
         self.db.close()
-
 
 def main():
     try:
