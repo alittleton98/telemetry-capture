@@ -4,8 +4,15 @@
 #   python telemetry_recorder.py
 #
 # Asks for the format file and MySQL login on startup.
-# Commands while running: start <name> | end | status | quit
+# Commands while running: start <name> | end | status | set <field> <value> | clear <field> | fields | quit
 # Shared memory capture needs Windows; UDP capture also runs on Linux.
+#
+# Custom fields: an optional "custom_fields" list in the format file adds columns whose value is set from the
+# terminal and written to every row until it is changed or cleared. "start" asks for each value, where an
+# empty answer means NULL; during the session "set" and "clear" change one. Each entry needs a name and a type
+# (int, float, bool or text), and may give "sql" to override the column type, "csv" for a format spec, and
+# "max_length" for text (default 255):
+#   "custom_fields": [{"name": "driver", "type": "text"}, {"name": "fuel_kg", "type": "float", "csv": ".1f"}]
 import codecs
 import csv
 import ctypes
@@ -45,9 +52,77 @@ BLOCK_GAP = 256  # fields closer than this are read as one block, so they come f
 STALE_SECONDS = 5  # with no new data for this long, let go of the mapping so a closed game can release it
 TORN_READ_RETRIES = 5
 
+CUSTOM_SQL_TYPES = {"int": "BIGINT", "float": "DOUBLE", "bool": "TINYINT(1)", "text": "VARCHAR({length})"}
+DEFAULT_TEXT_LENGTH = 255
+INT64_MIN, INT64_MAX = -2 ** 63, 2 ** 63 - 1
+TRUE_WORDS = {"true", "yes", "on", "1"}
+FALSE_WORDS = {"false", "no", "off", "0"}
+COMMANDS_HELP = "Commands: start <name> | end | status | set <field> <value> | clear <field> | fields | quit"
+
 
 class FormatError(Exception):
     pass
+
+
+class CustomField:
+    """A column the user sets from the terminal. Its value goes into every row until changed; NULL until set."""
+
+    def __init__(self, spec):
+        if not isinstance(spec, dict) or "name" not in spec or "type" not in spec:
+            raise FormatError(f"Custom field {spec} needs a name and a type")
+        self.name = spec["name"]
+        self.type = spec["type"]
+        if self.type not in CUSTOM_SQL_TYPES:
+            raise FormatError(f"Custom field {self.name}: type must be one of {', '.join(CUSTOM_SQL_TYPES)}")
+        self.max_length = spec.get("max_length", DEFAULT_TEXT_LENGTH)
+        if self.type == "text" and (not isinstance(self.max_length, int) or self.max_length < 1):
+            raise FormatError(f"Custom field {self.name}: max_length must be a positive whole number")
+        self.sql = spec.get("sql") or CUSTOM_SQL_TYPES[self.type].format(length=self.max_length)
+        self.csv = spec.get("csv")
+        if self.csv:
+            sample = {"int": 1, "float": 1.0, "bool": 1, "text": "a"}[self.type]
+            try:
+                format(sample, self.csv)
+            except ValueError:
+                raise FormatError(f"Custom field {self.name}: invalid csv format '{self.csv}'")
+
+    def parse(self, raw):
+        """Converts terminal input to this field's type. Raises ValueError with a message for the user."""
+        if self.type == "text":
+            if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'":
+                raw = raw[1:-1]  # quotes allow an empty value or surrounding spaces
+            if len(raw) > self.max_length:
+                raise ValueError(f"{self.name} takes at most {self.max_length} characters, got {len(raw)}")
+            return raw
+        if self.type == "int":
+            try:
+                value = int(raw)
+            except ValueError:
+                raise ValueError(f"{self.name} needs a whole number, got '{raw}'")
+            if not INT64_MIN <= value <= INT64_MAX:
+                raise ValueError(f"{self.name} is out of range for a 64-bit integer")
+            return value
+        if self.type == "float":
+            try:
+                value = float(raw)
+            except ValueError:
+                raise ValueError(f"{self.name} needs a number, got '{raw}'")
+            if not math.isfinite(value):
+                raise ValueError(f"{self.name} needs a finite number")  # MySQL rejects NaN and infinity
+            return value
+        word = raw.lower()
+        if word in TRUE_WORDS:
+            return 1
+        if word in FALSE_WORDS:
+            return 0
+        raise ValueError(f"{self.name} needs true or false (also yes/no, on/off, 1/0), got '{raw}'")
+
+    def show(self, value):
+        if value is None:
+            return "NULL"
+        if self.type == "bool":
+            return "true" if value else "false"
+        return repr(value) if self.type == "text" else str(value)
 
 
 class PacketFormat:
@@ -75,6 +150,10 @@ class PacketFormat:
         self.extra_columns = spec.get("extra_sql_columns", [])
         self.fields = spec["fields"]
         self.byte_order = spec["byte_order"]
+        custom = spec.get("custom_fields", [])
+        if not isinstance(custom, list):
+            raise FormatError("custom_fields must be a list")
+        self.custom_fields = [CustomField(entry) for entry in custom]
 
         if not self.fields:
             raise FormatError("No fields defined")
@@ -96,7 +175,9 @@ class PacketFormat:
                     raise FormatError(f"Field {field['name']}: invalid csv format '{field['csv']}'")
 
         self.names = [field["name"] for field in self.fields]
-        all_names = self.names + [column["name"] for column in self.extra_columns]
+        self.custom_names = [field.name for field in self.custom_fields]
+        self.columns = self.names + self.custom_names  # every row is the captured values, then the custom ones
+        all_names = self.columns + [column["name"] for column in self.extra_columns]
         for name in all_names + [self.database, self.working_table]:
             if not IDENTIFIER.match(name):
                 raise FormatError(f"Invalid SQL identifier: '{name}'")
@@ -115,7 +196,7 @@ class PacketFormat:
         self.bool_indexes = [i for i, field in enumerate(self.fields) if field["struct"] == "?"]
         self.text_fields = [(i, field["encoding"]) for i, field in enumerate(self.fields)
                             if field["struct"].endswith("s")]
-        self.csv_specs = [field.get("csv") for field in self.fields]
+        self.csv_specs = [field.get("csv") for field in self.fields] + [field.csv for field in self.custom_fields]
 
         capture = spec["capture"]
         method = capture.get("method") if isinstance(capture, dict) else None
@@ -157,16 +238,17 @@ class PacketFormat:
     def create_table_sql(self, table):
         columns = [f"`{c['name']}` {c['sql']}" for c in self.extra_columns]
         columns += [f"`{f['name']}` {f['sql']}" for f in self.fields]
+        columns += [f"`{f.name}` {f.sql}" for f in self.custom_fields]
         if self.primary_key:
             columns.append(f"PRIMARY KEY (`{self.primary_key}`)")
         return f"CREATE TABLE `{table}` (\n  " + ",\n  ".join(columns) + "\n)"
 
     def insert_sql(self, table):
-        columns = ", ".join(f"`{name}`" for name in self.names)
-        placeholders = ", ".join(["%s"] * len(self.names))
+        columns = ", ".join(f"`{name}`" for name in self.columns)
+        placeholders = ", ".join(["%s"] * len(self.columns))
         sql = f"INSERT INTO `{table}` ({columns}) VALUES ({placeholders})"
         if self.primary_key:
-            updates = ", ".join(f"`{name}`=VALUES(`{name}`)" for name in self.names)
+            updates = ", ".join(f"`{name}`=VALUES(`{name}`)" for name in self.columns)
             sql += f" ON DUPLICATE KEY UPDATE {updates}"
         return sql
 
@@ -714,7 +796,8 @@ class Recorder:
         self.db = db
         self.session = None
         self.pending = []
-        self.state_lock = threading.Lock()  # guards session and pending
+        self.custom_values = [None] * len(packet_format.custom_fields)  # replaced, never changed in place
+        self.state_lock = threading.Lock()  # guards session, pending and custom_values
         self.db_lock = threading.Lock()  # guards the database connection
         self.stop_event = threading.Event()
         self.last_db_error = None
@@ -729,7 +812,9 @@ class Recorder:
         for thread in self.threads:
             thread.start()
         print(f"Capturing {self.format.name} from {self.capture.describe()} ({len(self.format.names)} fields)")
-        print("Commands: start <name> | end | status | quit")
+        if self.format.custom_fields:
+            print(f"Custom fields (NULL until set): {', '.join(self.format.custom_names)}")
+        print(COMMANDS_HELP)
         try:
             self.command_loop()
         except (KeyboardInterrupt, EOFError):
@@ -751,12 +836,90 @@ class Recorder:
                 self.end_session()
             elif command == "status":
                 self.print_status()
+            elif command == "set":
+                self.set_custom(argument)
+            elif command == "clear":
+                self.clear_custom(argument)
+            elif command == "fields":
+                self.print_custom()
             elif command in ("quit", "exit"):
                 if self.session:
                     self.end_session()
                 return
             else:
-                print("Commands: start <name> | end | status | quit")
+                print(COMMANDS_HELP)
+
+    def find_custom(self, name):
+        """The index of a custom field by name, ignoring case like MySQL does, or None after saying why."""
+        if not self.format.custom_fields:
+            print("This format has no custom fields. Add a custom_fields list to the format file.")
+            return None
+        if not name:
+            print(f"Name a custom field: {', '.join(self.format.custom_names)}")
+            return None
+        for i, field_name in enumerate(self.format.custom_names):
+            if field_name.lower() == name.lower():
+                return i
+        print(f"No custom field '{name}'. Custom fields: {', '.join(self.format.custom_names)}")
+        return None
+
+    def set_custom(self, argument):
+        parts = argument.strip().split(None, 1)
+        index = self.find_custom(parts[0] if parts else "")
+        if index is None:
+            return
+        field = self.format.custom_fields[index]
+        if len(parts) < 2:
+            print(f"Usage: set {field.name} <{field.type} value>. Use clear {field.name} to set it to NULL.")
+            return
+        try:
+            value = field.parse(parts[1].strip())
+        except ValueError as e:
+            print(e)
+            return
+        self.store_custom(index, value)
+        print(f"{field.name} = {field.show(value)}")
+
+    def clear_custom(self, argument):
+        index = self.find_custom(argument.strip())
+        if index is None:
+            return
+        self.store_custom(index, None)
+        print(f"{self.format.custom_names[index]} = NULL")
+
+    def prompt_custom(self):
+        """Asks for each custom field's value for a new session. Empty input means NULL."""
+        if not self.format.custom_fields:
+            return
+        print("Custom field values for this session (press Enter for NULL):")
+        values = []
+        for field in self.format.custom_fields:
+            while True:
+                raw = input(f"  {field.name} ({field.type}): ").strip()
+                if not raw:
+                    values.append(None)
+                    break
+                try:
+                    values.append(field.parse(raw))
+                    break
+                except ValueError as e:
+                    print(f"  {e}")
+        with self.state_lock:
+            self.custom_values = values
+
+    def store_custom(self, index, value):
+        with self.state_lock:
+            values = list(self.custom_values)
+            values[index] = value
+            self.custom_values = values
+
+    def print_custom(self):
+        if not self.format.custom_fields:
+            print("This format has no custom fields.")
+            return
+        values = self.custom_values
+        for field, value in zip(self.format.custom_fields, values):
+            print(f"  {field.name} ({field.type}) = {field.show(value)}")
 
     def start_session(self, raw_name):
         if self.session:
@@ -766,6 +929,7 @@ class Recorder:
         if not name:
             print("A session needs a name made of letters or numbers.")
             return
+        self.prompt_custom()
 
         prefix = f"session_{datetime.now().strftime('%y%m%d_%H%M%S')}_"
         name = name[:MAX_TABLE_NAME - len(prefix)].rstrip("_")
@@ -790,7 +954,7 @@ class Recorder:
             print(f"Could not create the CSV: {e}")
             return
         writer = csv.writer(outfile)
-        writer.writerow(self.format.names)
+        writer.writerow(self.format.columns)
 
         with self.state_lock:
             self.pending = []
@@ -842,6 +1006,8 @@ class Recorder:
         capture_status = self.capture.status()
         if capture_status:
             print(capture_status)
+        if self.format.custom_fields:
+            self.print_custom()
 
     def capture_loop(self):
         while not self.stop_event.is_set():
@@ -861,9 +1027,10 @@ class Recorder:
                 session = self.session
                 if not session:
                     continue
-                session.writer.writerow(self.format.csv_row(values))
+                row = values + self.custom_values
+                session.writer.writerow(self.format.csv_row(row))
                 session.rows += 1
-                self.pending.append(self.format.sql_row(values))
+                self.pending.append(self.format.sql_row(row))
                 if not session.announced:
                     session.announced = True
                     print(f"Capturing telemetry for session '{session.name}'")
