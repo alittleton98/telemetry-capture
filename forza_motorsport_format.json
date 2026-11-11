@@ -15,6 +15,10 @@
   "extra_sql_columns": [
     { "name": "time", "sql": "TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP(3)" }
   ],
+  "custom_fields": [
+    { "name": "driver", "type": "text" },
+    { "name": "tire_type", "type": "text" }
+  ],
   "fields": [
     { "name": "IsRaceOn", "struct": "i", "sql": "TINYINT" },
     { "name": "TimestampMS", "struct": "I", "sql": "BIGINT UNSIGNED" },
